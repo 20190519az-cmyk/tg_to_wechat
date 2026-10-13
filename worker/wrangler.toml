@@ -13,3 +13,6 @@ crons = ["* * * * *"]  # 每分钟
 [[kv_namespaces]]
 binding = "STATE"
 id = "KV_NAMESPACE_ID"  # 部署时由 GitHub Actions 自动替换
+
+[observability]
+enabled = true  # 在 Cloudflare 控制台 → tg2wecom → Logs 查看每次运行的日志
