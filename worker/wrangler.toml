@@ -2,7 +2,7 @@ name = "tg2wecom"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
 compatibility_flags = ["nodejs_compat"]
-workers_dev = false  # 只用定时任务，不需要对外网址
+workers_dev = true  # 提供受保护的手动触发地址 /run（诊断用）
 
 [vars]
 TG_CHANNEL = "jdbroo"

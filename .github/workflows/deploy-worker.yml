@@ -92,6 +92,8 @@ jobs:
       - name: 部署
         run: |
           secrets=$(mktemp)
-          jq -n --arg w "$WECOM_WEBHOOK" '{WECOM_WEBHOOK: $w}' > "$secrets"
+          # RUN_KEY 由 API Token 派生，诊断工作流用同样方式算出来调用 /run
+          run_key=$(printf '%s' "tg2wecom:$CLOUDFLARE_API_TOKEN" | sha256sum | cut -c1-40)
+          jq -n --arg w "$WECOM_WEBHOOK" --arg k "$run_key" '{WECOM_WEBHOOK: $w, RUN_KEY: $k}' > "$secrets"
           npx wrangler deploy --secrets-file "$secrets"
           rm -f "$secrets"

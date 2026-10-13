@@ -23,6 +23,30 @@ export default {
   async scheduled(event, env, ctx) {
     await run(env);
   },
+
+  // 手动触发一次（诊断用）：POST /run，请求头 x-run-key 必须等于 RUN_KEY
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (request.method !== "POST" || url.pathname !== "/run" || !env.RUN_KEY ||
+        request.headers.get("x-run-key") !== env.RUN_KEY) {
+      return new Response("not found", { status: 404 });
+    }
+    const logs = [];
+    const log = console.log;
+    console.log = (...a) => { logs.push(a.join(" ")); log(...a); };
+    let status = 200;
+    try {
+      await run(env);
+    } catch (e) {
+      logs.push(`错误: ${e.message}`);
+      status = 500;
+    } finally {
+      console.log = log;
+    }
+    return new Response(logs.join("\n") + "\n", {
+      status, headers: { "content-type": "text/plain; charset=utf-8" },
+    });
+  },
 };
 
 function channelOf(env) {
