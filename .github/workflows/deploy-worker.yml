@@ -19,10 +19,9 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       ACCOUNT_ID_SECRET: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
-      FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-      FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
       FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
       FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+      FEISHU_CHAT_ID: ${{ secrets.FEISHU_CHAT_ID }}
       KV_TITLE: tg2wecom-state
     defaults:
       run:
@@ -33,7 +32,9 @@ jobs:
       - name: 检查 Secrets
         run: |
           if [ -z "$CLOUDFLARE_API_TOKEN" ]; then echo "::error::缺少仓库 Secret: CLOUDFLARE_API_TOKEN"; exit 1; fi
-          if [ -z "$WECOM_WEBHOOK$FEISHU_WEBHOOK" ]; then echo "::error::WECOM_WEBHOOK 和 FEISHU_WEBHOOK 至少要添加一个"; exit 1; fi
+          if [ -z "$WECOM_WEBHOOK" ] && { [ -z "$FEISHU_APP_ID" ] || [ -z "$FEISHU_APP_SECRET" ]; }; then
+            echo "::error::WECOM_WEBHOOK 和 FEISHU_APP_ID + FEISHU_APP_SECRET 至少要添加一组"; exit 1
+          fi
           # 没填 CLOUDFLARE_ACCOUNT_ID 时用 API Token 自动查
           if [ -n "$ACCOUNT_ID_SECRET" ]; then
             echo "CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID_SECRET" >> "$GITHUB_ENV"
@@ -98,17 +99,16 @@ jobs:
           # RUN_KEY 由 API Token 派生，诊断工作流用同样方式算出来调用 /run
           run_key=$(printf '%s' "tg2wecom:$CLOUDFLARE_API_TOKEN" | sha256sum | cut -c1-40)
           # 没配置的推送渠道写成空字符串，相当于关闭（删除 Secret 后重新部署即可停用）
-          jq -n --arg w "$WECOM_WEBHOOK" --arg fw "$FEISHU_WEBHOOK" --arg fs "$FEISHU_SECRET" \
-                --arg fi "$FEISHU_APP_ID" --arg fa "$FEISHU_APP_SECRET" --arg k "$run_key" \
-            '{WECOM_WEBHOOK: $w, FEISHU_WEBHOOK: $fw, FEISHU_SECRET: $fs,
-              FEISHU_APP_ID: $fi, FEISHU_APP_SECRET: $fa, RUN_KEY: $k}' > "$secrets"
+          jq -n --arg w "$WECOM_WEBHOOK" --arg fi "$FEISHU_APP_ID" --arg fa "$FEISHU_APP_SECRET" \
+                --arg fc "$FEISHU_CHAT_ID" --arg k "$run_key" \
+            '{WECOM_WEBHOOK: $w, FEISHU_APP_ID: $fi, FEISHU_APP_SECRET: $fa, FEISHU_CHAT_ID: $fc, RUN_KEY: $k}' > "$secrets"
           npx wrangler deploy --secrets-file "$secrets"
           rm -f "$secrets"
 
       - name: 清理已停用的 Secret
         run: |
-          # ntfy 已移除，删掉 Worker 上残留的配置（不存在时忽略）
-          for name in NTFY_URL NTFY_TOKEN; do
+          # ntfy 和飞书 webhook 方式已移除，删掉 Worker 上残留的配置（不存在时忽略）
+          for name in NTFY_URL NTFY_TOKEN FEISHU_WEBHOOK FEISHU_SECRET; do
             curl -sS -o /dev/null -X DELETE -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
               "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/tg2wecom/secrets/$name" || true
           done

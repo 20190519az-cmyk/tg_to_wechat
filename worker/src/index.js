@@ -5,19 +5,18 @@
  * 绑定 / 变量（企微和飞书至少配一个，都是 wrangler secret）：
  *   STATE              KV 命名空间
  *   WECOM_WEBHOOK      企微群机器人 webhook
- *   FEISHU_WEBHOOK     飞书群自定义机器人 webhook
- *   FEISHU_SECRET      飞书机器人签名密钥，可选（机器人开启了「签名校验」时必填）
- *   FEISHU_APP_ID      飞书自建应用 App ID，可选（配了才能在飞书里发图片）
- *   FEISHU_APP_SECRET  飞书自建应用 App Secret，可选
+ *   FEISHU_APP_ID      飞书自建应用 App ID（应用机器人会发到它所在的所有群）
+ *   FEISHU_APP_SECRET  飞书自建应用 App Secret
+ *   FEISHU_CHAT_ID     可选，只发到指定的群（多个用逗号分隔）；不填则发到机器人所在的所有群
  *   TG_CHANNEL         频道用户名，不带 @
  */
 import { Buffer } from "node:buffer";
-import { createHash, createHmac } from "node:crypto";
+import { createHash } from "node:crypto";
 
 const TEXT_LIMIT = 2000;
 const IMAGE_LIMIT = 2 * 1024 * 1024; // 企微图片上限
 const FEISHU_IMAGE_LIMIT = 10 * 1024 * 1024; // 飞书图片上限
-const FEISHU_TEXT_LIMIT = 15000; // 飞书 webhook 请求体上限 20KB，正文留余量
+const FEISHU_TEXT_LIMIT = 30000; // 飞书富文本消息上限 150KB，正文留足余量
 const FEISHU_API = "https://open.feishu.cn/open-apis";
 const SEND_INTERVAL = 3200; // 企微限 20 条/分钟
 const MAX_SENDS_PER_RUN = 18; // 每分钟跑一次，单次最多发 18 条，剩下的下一分钟继续
@@ -64,8 +63,8 @@ export async function run(env) {
   const channel = channelOf(env);
   const sender = new Sender(env.WECOM_WEBHOOK || null);
   // 只配了飞书时，飞书出错要中止并补发；同时配了企微时飞书只是尽力而为，不影响企微（也避免企微重复发送）
-  const feishu = env.FEISHU_WEBHOOK ? new Feishu(env, !env.WECOM_WEBHOOK) : null;
-  if (!env.WECOM_WEBHOOK && !feishu) throw new Error("WECOM_WEBHOOK 和 FEISHU_WEBHOOK 至少要配一个");
+  const feishu = env.FEISHU_APP_ID && env.FEISHU_APP_SECRET ? new Feishu(env, !env.WECOM_WEBHOOK) : null;
+  if (!env.WECOM_WEBHOOK && !feishu) throw new Error("WECOM_WEBHOOK 和 FEISHU_APP_ID/FEISHU_APP_SECRET 至少要配一个");
 
   const res = await fetch(`https://t.me/s/${channel}`, { headers: UA });
   if (!res.ok) throw new Error(`抓取失败: HTTP ${res.status}`);
@@ -284,18 +283,17 @@ class Sender {
   }
 }
 
-// ---------------- 飞书 ----------------
+// ---------------- 飞书（自建应用机器人） ----------------
 class Feishu {
   constructor(env, strict) {
-    this.webhook = env.FEISHU_WEBHOOK;
-    this.secret = env.FEISHU_SECRET || "";
-    this.appId = env.FEISHU_APP_ID || "";
-    this.appSecret = env.FEISHU_APP_SECRET || "";
+    this.appId = env.FEISHU_APP_ID;
+    this.appSecret = env.FEISHU_APP_SECRET;
+    this.chatIds = (env.FEISHU_CHAT_ID || "").split(",").map((x) => x.trim()).filter(Boolean);
     this.strict = strict;
     this.token = null; // tenant_access_token，本次运行内复用
   }
 
-  // 一条帖子发成一条富文本消息：标题 + 正文 + 原帖链接 + 图片
+  // 一条帖子发成一条富文本消息：正文 + 原帖链接 + 图片，发到每个目标群
   async post(title, text, link, images = []) {
     try {
       const body = splitBytes(text, FEISHU_TEXT_LIMIT);
@@ -308,65 +306,70 @@ class Feishu {
         if (key) content.push([{ tag: "img", image_key: key }]);
         else missing++;
       }
-      if (missing) {
-        const note = this.appId ? `${missing} 张图片未能上传` : `含 ${missing} 张图片`;
-        content.push([{ tag: "text", text: `[${note}，请点原帖查看]` }]);
+      if (missing) content.push([{ tag: "text", text: `[${missing} 张图片未能上传，请点原帖查看]` }]);
+      const msg = JSON.stringify({ zh_cn: { title, content } });
+      const chats = await this.chats();
+      if (!chats.length) throw new Error("机器人还没有加入任何群，请先把应用机器人拉进群");
+      for (const chatId of chats) {
+        await this.api("/im/v1/messages?receive_id_type=chat_id", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ receive_id: chatId, msg_type: "post", content: msg }),
+        });
       }
-      await this.send({ msg_type: "post", content: { post: { zh_cn: { title, content } } } });
     } catch (e) {
       if (this.strict) throw new Error(`飞书发送失败: ${e.message}`);
       console.log(`飞书发送失败: ${e.message}`);
     }
   }
 
-  async send(payload) {
-    if (this.secret) { // 签名校验：以「时间戳\n密钥」为 key 对空串做 HmacSHA256
-      const timestamp = String(Math.floor(Date.now() / 1000));
-      payload = {
-        timestamp,
-        sign: createHmac("sha256", `${timestamp}\n${this.secret}`).update("").digest("base64"),
-        ...payload,
-      };
+  async api(path, init) {
+    if (!this.token) {
+      const r = await fetch(`${FEISHU_API}/auth/v3/tenant_access_token/internal`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ app_id: this.appId, app_secret: this.appSecret }),
+      });
+      const t = await r.json();
+      if (t.code !== 0) throw new Error(`获取 token 失败（检查 App ID/Secret）: ${JSON.stringify(t)}`);
+      this.token = t.tenant_access_token;
     }
-    const r = await fetch(this.webhook, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
+    const r = await fetch(`${FEISHU_API}${path}`, {
+      ...init,
+      headers: { ...(init?.headers || {}), Authorization: `Bearer ${this.token}` },
     });
-    const data = await r.json().catch(() => ({}));
-    const code = data.code ?? data.StatusCode;
-    if (code !== 0) throw new Error(`HTTP ${r.status} ${JSON.stringify(data)}`);
+    const res = await r.json().catch(() => ({}));
+    if (res.code !== 0) throw new Error(`${path.split("?")[0]} → HTTP ${r.status} ${JSON.stringify(res).slice(0, 300)}`);
+    return res.data;
   }
 
-  // 没配自建应用时返回 null，图片只能靠原帖链接查看
+  // 没指定 FEISHU_CHAT_ID 时，发到机器人所在的所有群
+  async chats() {
+    if (this.chatIds.length) return this.chatIds;
+    const ids = [];
+    let pageToken = "";
+    do {
+      const q = new URLSearchParams({ page_size: "100" });
+      if (pageToken) q.set("page_token", pageToken);
+      const data = await this.api(`/im/v1/chats?${q}`, { method: "GET" });
+      for (const c of data.items || []) ids.push(c.chat_id);
+      pageToken = data.has_more ? data.page_token : "";
+    } while (pageToken);
+    this.chatIds = ids;
+    return ids;
+  }
+
   async uploadImage(data) {
-    if (!this.appId || !this.appSecret) return null;
     if (data.length > FEISHU_IMAGE_LIMIT) {
       console.log("图片超过 10MB，飞书跳过");
       return null;
     }
     try {
-      if (!this.token) {
-        const r = await fetch(`${FEISHU_API}/auth/v3/tenant_access_token/internal`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ app_id: this.appId, app_secret: this.appSecret }),
-        });
-        const t = await r.json();
-        if (t.code !== 0) throw new Error(`获取 token 失败: ${JSON.stringify(t)}`);
-        this.token = t.tenant_access_token;
-      }
       const form = new FormData();
       form.append("image_type", "message");
       form.append("image", new Blob([data]), "image.jpg");
-      const r = await fetch(`${FEISHU_API}/im/v1/images`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${this.token}` },
-        body: form,
-      });
-      const res = await r.json();
-      if (res.code !== 0) throw new Error(JSON.stringify(res));
-      return res.data.image_key;
+      const res = await this.api("/im/v1/images", { method: "POST", body: form });
+      return res.image_key;
     } catch (e) {
       console.log(`飞书图片上传失败: ${e.message}`);
       return null;
