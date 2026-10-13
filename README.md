@@ -17,8 +17,10 @@
 
 | Name | Value |
 |---|---|
-| `WECOM_WEBHOOK` | 企微群机器人 webhook 地址 |
+| `WECOM_WEBHOOK` | 企微群机器人 webhook 地址（和 `NTFY_URL` 至少填一个） |
 | `CLOUDFLARE_API_TOKEN` | 上一步的 API Token |
+| `NTFY_URL` | 可选，推送到 ntfy App，见下方「手机 App 推送（ntfy）」 |
+| `NTFY_TOKEN` | 可选，ntfy 访问令牌（用自己的 ntfy 账号或服务器时才需要） |
 | `CLOUDFLARE_ACCOUNT_ID` | 可选。不填会用 Token 自动获取；只有一个 Cloudflare 账号下有多个 Account 时才需要填（浏览器地址栏 `dash.cloudflare.com/` 后面那串 32 位字符） |
 
 ### 3. 部署
@@ -26,6 +28,17 @@
 跑成功（绿色 ✓）就部署好了，之后每分钟自动检查。
 
 以后修改 `worker/` 里的文件并推送，会自动重新部署。
+
+## 手机 App 推送（ntfy）
+
+除了企业微信，也可以推送到手机上的 [ntfy](https://ntfy.sh) App（开源，安卓不依赖谷歌推送，国内手机也能用）。图片会作为附件上传，国内也能直接看到。
+
+1. 想一个别人猜不到的主题名，比如 `tg-` 加一串随机字符。**主题名就相当于密码**，知道的人都能收到消息。
+2. 仓库 Secrets 里添加 `NTFY_URL` = `https://ntfy.sh/<主题名>`，然后重新运行部署。
+3. 手机安装 ntfy（安卓：应用商店、F-Droid 或 GitHub Releases；iOS：App Store），点「+」订阅同一个主题名。
+4. 安卓上建议：设置里开启「即时送达」(Instant delivery)，并在系统设置里允许 ntfy 后台运行、关闭电池优化，否则可能收不到或有延迟。
+
+同时配置企业微信和 ntfy 时，两边都会收到；ntfy 出错不影响企业微信。想停用某一边，删掉对应的 Secret 后重新部署即可。
 
 ## 说明
 

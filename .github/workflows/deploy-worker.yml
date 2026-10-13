@@ -19,6 +19,8 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       ACCOUNT_ID_SECRET: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+      NTFY_URL: ${{ secrets.NTFY_URL }}
+      NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
       KV_TITLE: tg2wecom-state
     defaults:
       run:
@@ -28,9 +30,8 @@ jobs:
 
       - name: 检查 Secrets
         run: |
-          for v in CLOUDFLARE_API_TOKEN WECOM_WEBHOOK; do
-            if [ -z "${!v}" ]; then echo "::error::缺少仓库 Secret: $v"; exit 1; fi
-          done
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then echo "::error::缺少仓库 Secret: CLOUDFLARE_API_TOKEN"; exit 1; fi
+          if [ -z "$WECOM_WEBHOOK$NTFY_URL" ]; then echo "::error::WECOM_WEBHOOK 和 NTFY_URL 至少要添加一个"; exit 1; fi
           # 没填 CLOUDFLARE_ACCOUNT_ID 时用 API Token 自动查
           if [ -n "$ACCOUNT_ID_SECRET" ]; then
             echo "CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID_SECRET" >> "$GITHUB_ENV"
@@ -94,6 +95,8 @@ jobs:
           secrets=$(mktemp)
           # RUN_KEY 由 API Token 派生，诊断工作流用同样方式算出来调用 /run
           run_key=$(printf '%s' "tg2wecom:$CLOUDFLARE_API_TOKEN" | sha256sum | cut -c1-40)
-          jq -n --arg w "$WECOM_WEBHOOK" --arg k "$run_key" '{WECOM_WEBHOOK: $w, RUN_KEY: $k}' > "$secrets"
+          # 没配置的推送渠道写成空字符串，相当于关闭（删除 Secret 后重新部署即可停用）
+          jq -n --arg w "$WECOM_WEBHOOK" --arg n "$NTFY_URL" --arg t "$NTFY_TOKEN" --arg k "$run_key" \
+            '{WECOM_WEBHOOK: $w, NTFY_URL: $n, NTFY_TOKEN: $t, RUN_KEY: $k}' > "$secrets"
           npx wrangler deploy --secrets-file "$secrets"
           rm -f "$secrets"

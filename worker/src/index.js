@@ -1,17 +1,20 @@
 /**
  * Cloudflare Worker：每分钟抓取 Telegram 公开频道网页版 (t.me/s/<频道>)，
- * 把新消息推送到企业微信群机器人。已转发的最新消息 ID 存在 KV (STATE)。
+ * 把新消息推送到企业微信群机器人和/或 ntfy。已转发的最新消息 ID 存在 KV (STATE)。
  *
- * 绑定 / 变量：
+ * 绑定 / 变量（企微和 ntfy 至少配一个）：
  *   STATE          KV 命名空间
  *   WECOM_WEBHOOK  企微群机器人 webhook（wrangler secret）
+ *   NTFY_URL       ntfy 主题地址，如 https://ntfy.sh/<主题>（wrangler secret）
+ *   NTFY_TOKEN     ntfy 访问令牌，可选（wrangler secret）
  *   TG_CHANNEL     频道用户名，不带 @
  */
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 
 const TEXT_LIMIT = 2000;
-const IMAGE_LIMIT = 2 * 1024 * 1024;
+const IMAGE_LIMIT = 2 * 1024 * 1024; // 企微图片上限
+const NTFY_IMAGE_LIMIT = 15 * 1024 * 1024; // ntfy.sh 附件上限
 const SEND_INTERVAL = 3200; // 企微限 20 条/分钟
 const MAX_SENDS_PER_RUN = 18; // 每分钟跑一次，单次最多发 18 条，剩下的下一分钟继续
 const UA = {
@@ -55,7 +58,10 @@ function channelOf(env) {
 
 export async function run(env) {
   const channel = channelOf(env);
-  const sender = new Sender(env.WECOM_WEBHOOK);
+  const sender = new Sender(env.WECOM_WEBHOOK || null);
+  // 只配了 ntfy 时，ntfy 出错要中止并补发；同时配了企微时 ntfy 只是尽力而为，不影响企微
+  const ntfy = env.NTFY_URL ? new Ntfy(env.NTFY_URL, env.NTFY_TOKEN, !env.WECOM_WEBHOOK) : null;
+  if (!env.WECOM_WEBHOOK && !ntfy) throw new Error("WECOM_WEBHOOK 和 NTFY_URL 至少要配一个");
 
   const res = await fetch(`https://t.me/s/${channel}`, { headers: UA });
   if (!res.ok) throw new Error(`抓取失败: HTTP ${res.status}`);
@@ -68,7 +74,9 @@ export async function run(env) {
   const stored = await env.STATE.get(channel);
   if (stored === null) { // 首次运行：不刷屏，只记录位置并发一条测试消息
     const newest = posts[posts.length - 1].id;
-    await sender.text(`✅ 已开始监听【${title}】，之后的新消息会自动转发到本群。`);
+    const hello = `✅ 已开始监听【${title}】，之后的新消息会自动转发过来。`;
+    await sender.text(hello);
+    if (ntfy) await ntfy.text(title, hello);
     await env.STATE.put(channel, String(newest));
     console.log(`初始化完成，从 #${newest} 之后开始转发`);
     return;
@@ -84,7 +92,13 @@ export async function run(env) {
       // 剩余额度不够发完整条消息就留到下一分钟（单条超额时至少发一条，避免卡死）
       if (done !== lastId && sender.count + parts > MAX_SENDS_PER_RUN) break;
       await sender.text(formatPost(p, title, channel));
-      for (const url of p.photos) await sender.image(url);
+      if (ntfy) await ntfy.text(title, formatBody(p), `https://t.me/${channel}/${p.id}`);
+      for (const [i, url] of p.photos.entries()) {
+        const data = await downloadImage(url);
+        if (!data) continue;
+        await sender.image(data);
+        if (ntfy) await ntfy.image(title, data, `${p.id}_${i + 1}.jpg`);
+      }
       done = p.id;
     }
   } finally {
@@ -93,10 +107,25 @@ export async function run(env) {
   }
 }
 
-function formatPost(p, title, channel) {
-  let body = `【${title}】\n${p.text || "（无文字）"}`;
+function formatBody(p) {
+  let body = p.text || "（无文字）";
   if (p.other) body += "\n\n[含视频/文件等内容，请点链接查看]";
-  return body + `\nhttps://t.me/${channel}/${p.id}`;
+  return body;
+}
+
+function formatPost(p, title, channel) {
+  return `【${title}】\n${formatBody(p)}\nhttps://t.me/${channel}/${p.id}`;
+}
+
+async function downloadImage(url) {
+  try {
+    const r = await fetch(url, { headers: UA });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return Buffer.from(await r.arrayBuffer());
+  } catch (e) {
+    console.log(`图片下载失败 ${url}: ${e}`);
+    return null;
+  }
 }
 
 // ---------------- 解析 ----------------
@@ -194,13 +223,13 @@ function decodeEntities(s) {
 // ---------------- 企业微信 ----------------
 class Sender {
   constructor(webhook) {
-    if (!webhook) throw new Error("缺少 WECOM_WEBHOOK");
-    this.webhook = webhook;
+    this.webhook = webhook; // 为空时不发企微
     this.last = 0;
     this.count = 0;
   }
 
   async post(payload) {
+    if (!this.webhook) return;
     for (let attempt = 0; attempt < 5; attempt++) {
       const wait = SEND_INTERVAL - (Date.now() - this.last);
       if (this.last && wait > 0) await sleep(wait);
@@ -238,24 +267,62 @@ class Sender {
     }
   }
 
-  async image(url) {
-    let data;
-    try {
-      const r = await fetch(url, { headers: UA });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      data = Buffer.from(await r.arrayBuffer());
-    } catch (e) {
-      console.log(`图片下载失败 ${url}: ${e}`);
-      return;
-    }
+  async image(data) {
+    if (!this.webhook) return;
     if (data.length > IMAGE_LIMIT) { // Worker 里不方便压缩，超限的图片靠原帖链接查看
-      console.log(`图片超过 2MB，跳过 ${url}`);
+      console.log("图片超过 2MB，企微跳过");
       return;
     }
     await this.post({
       msgtype: "image",
       image: { base64: data.toString("base64"), md5: createHash("md5").update(data).digest("hex") },
     });
+  }
+}
+
+// ---------------- ntfy ----------------
+class Ntfy {
+  constructor(topicUrl, token, strict) {
+    const u = new URL(topicUrl);
+    this.topicUrl = u.origin + u.pathname.replace(/\/$/, "");
+    this.origin = u.origin;
+    this.topic = u.pathname.replace(/^\/|\/$/g, "");
+    this.auth = token ? { Authorization: `Bearer ${token}` } : {};
+    this.strict = strict;
+  }
+
+  async send(desc, doFetch) {
+    try {
+      const r = await doFetch();
+      if (!r.ok) throw new Error(`HTTP ${r.status} ${(await r.text()).slice(0, 200)}`);
+    } catch (e) {
+      if (this.strict) throw new Error(`ntfy ${desc}发送失败: ${e.message}`);
+      console.log(`ntfy ${desc}发送失败: ${e.message}`);
+    }
+  }
+
+  text(title, message, click) {
+    const body = { topic: this.topic, title, message };
+    if (click) body.click = click;
+    return this.send("文字", () => fetch(this.origin, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...this.auth },
+      body: JSON.stringify(body),
+    }));
+  }
+
+  // 图片作为附件上传到 ntfy，国内打开 App 也能直接看到（不依赖 Telegram 的图片地址）
+  image(title, data, filename) {
+    if (data.length > NTFY_IMAGE_LIMIT) {
+      console.log("图片超过 15MB，ntfy 跳过");
+      return;
+    }
+    const q = new URLSearchParams({ filename, title, message: "图片" });
+    return this.send("图片", () => fetch(`${this.topicUrl}?${q}`, {
+      method: "PUT",
+      headers: this.auth,
+      body: data,
+    }));
   }
 }
 
