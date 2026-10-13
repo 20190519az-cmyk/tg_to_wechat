@@ -10,6 +10,15 @@ TG_CHANNEL = "jdbroo"
 [triggers]
 crons = ["* * * * *"]  # 每分钟
 
+[[durable_objects.bindings]]
+name = "STATE_DO"
+class_name = "State"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["State"]
+
+# 旧版进度存在 KV 里，保留绑定用于迁移
 [[kv_namespaces]]
 binding = "STATE"
 id = "KV_NAMESPACE_ID"  # 部署时由 GitHub Actions 自动替换

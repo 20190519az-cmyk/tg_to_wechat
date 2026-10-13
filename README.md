@@ -58,7 +58,8 @@
 ## 说明
 
 - 首次运行只记录当前位置，不会把历史消息刷屏；如果之前用过 GitHub Actions 版本，会接着 `state.json` 里的进度转发。
-- 进度保存在 Cloudflare KV（`tg2wecom-state`），由 Worker 自动维护。
+- 进度保存在 Worker 的 Durable Object 里（强一致，并带锁防止两轮同时运行导致重复发送）。旧版存在 KV（`tg2wecom-state`）的进度会自动迁移。
+- 免费版每次运行只有 10ms CPU，所以每轮最多处理 3 条帖子 / 4 张图片，消息多的时候剩下的下一分钟继续。某条帖子反复中途失败时会改为只发文字。
 - 想换频道：改 `worker/wrangler.toml` 里的 `TG_CHANNEL`，推送后自动重新部署，新频道会从当前位置开始。
 - 视频、文件无法转发，会附原帖链接；超过 2MB 的图片也只附链接。
 - 想看频道每天发多少条：Actions →「统计频道发帖量」→ Run workflow。

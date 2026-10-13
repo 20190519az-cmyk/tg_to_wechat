@@ -11,7 +11,6 @@ jobs:
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       ACCOUNT_ID_SECRET: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      KV_TITLE: tg2wecom-state
     defaults:
       run:
         working-directory: worker
@@ -33,9 +32,9 @@ jobs:
           [ -n "$account" ] || account=$(curl -fsS "${auth[@]}" "https://api.cloudflare.com/client/v4/accounts" | jq -r '.result[0].id')
           echo "CLOUDFLARE_ACCOUNT_ID=$account" >> "$GITHUB_ENV"
           api="https://api.cloudflare.com/client/v4/accounts/$account"
-          id=$(curl -fsS "${auth[@]}" "$api/storage/kv/namespaces?per_page=100" | jq -r --arg t "$KV_TITLE" '.result[] | select(.title==$t) | .id' | head -n1)
-          channel=$(sed -n 's/^TG_CHANNEL = "\(.*\)"/\1/p' wrangler.toml)
-          echo "KV 进度: #$(curl -sS "${auth[@]}" "$api/storage/kv/namespaces/$id/values/$channel")"
+          sub=$(curl -fsS "${auth[@]}" "$api/workers/subdomain" | jq -r '.result.subdomain')
+          run_key=$(printf '%s' "tg2wecom:$CLOUDFLARE_API_TOKEN" | sha256sum | cut -c1-40)
+          curl -sS -H "x-run-key: $run_key" "https://tg2wecom.$sub.workers.dev/state" || true
           echo "定时任务:"
           curl -sS "${auth[@]}" "$api/workers/scripts/tg2wecom/schedules" | jq -c '.result'
 
