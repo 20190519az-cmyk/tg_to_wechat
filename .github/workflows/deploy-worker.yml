@@ -1,0 +1,70 @@
+name: 部署 Cloudflare Worker（每分钟转发）
+
+on:
+  push:
+    paths:
+      - "worker/**"
+      - ".github/workflows/deploy-worker.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+      KV_TITLE: tg2wecom-state
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查 Secrets
+        run: |
+          for v in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID WECOM_WEBHOOK; do
+            if [ -z "${!v}" ]; then echo "::error::缺少仓库 Secret: $v"; exit 1; fi
+          done
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - run: npm ci
+
+      - name: 准备 KV 存储
+        run: |
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces"
+          auth=(-H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          id=$(curl -fsS "${auth[@]}" "$api?per_page=100" | jq -r --arg t "$KV_TITLE" '.result[] | select(.title==$t) | .id' | head -n1)
+          if [ -z "$id" ]; then
+            id=$(curl -fsS "${auth[@]}" -H "Content-Type: application/json" -X POST "$api" \
+                 -d "{\"title\":\"$KV_TITLE\"}" | jq -r '.result.id')
+            echo "已创建 KV: $id"
+          fi
+          [ -n "$id" ] && [ "$id" != "null" ] || { echo "::error::KV 创建失败，检查 API Token 权限"; exit 1; }
+          sed -i "s/KV_NAMESPACE_ID/$id/" wrangler.toml
+
+          # 从 GitHub Actions 版本的进度接着转发，避免切换时漏发或重发
+          channel=$(sed -n 's/^TG_CHANNEL = "\(.*\)"/\1/p' wrangler.toml)
+          last=$(jq -r --arg c "$channel" '.[$c] // empty' ../state.json 2>/dev/null || true)
+          code=$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" "$api/$id/values/$channel")
+          if [ "$code" = "404" ] && [ -n "$last" ]; then
+            curl -fsS "${auth[@]}" -X PUT "$api/$id/values/$channel" --data "$last" > /dev/null
+            echo "已从 state.json 导入进度: #$last"
+          fi
+
+      - name: 部署
+        run: |
+          secrets=$(mktemp)
+          jq -n --arg w "$WECOM_WEBHOOK" '{WECOM_WEBHOOK: $w}' > "$secrets"
+          npx wrangler deploy --secrets-file "$secrets"
+          rm -f "$secrets"

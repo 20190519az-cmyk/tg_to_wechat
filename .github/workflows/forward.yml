@@ -1,9 +1,9 @@
-name: TG 频道转发到企业微信
+name: TG 频道转发到企业微信（备用）
 
+# 已改用 Cloudflare Worker 每分钟转发（见 worker/），这里的定时任务已停用。
+# 只在 Worker 不可用时作为备用手动运行；不要和 Worker 同时开着，否则会重复转发。
 on:
-  schedule:
-    - cron: "*/5 * * * *"   # 每 5 分钟（GitHub 高峰期可能延迟）
-  workflow_dispatch:         # 允许在 Actions 页面手动运行
+  workflow_dispatch:
 
 permissions:
   contents: write            # 需要把 state.json 提交回仓库

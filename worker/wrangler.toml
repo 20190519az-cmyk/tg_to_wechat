@@ -1,0 +1,15 @@
+name = "tg2wecom"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false  # 只用定时任务，不需要对外网址
+
+[vars]
+TG_CHANNEL = "jdbroo"
+
+[triggers]
+crons = ["* * * * *"]  # 每分钟
+
+[[kv_namespaces]]
+binding = "STATE"
+id = "KV_NAMESPACE_ID"  # 部署时由 GitHub Actions 自动替换
