@@ -1,4 +1,4 @@
-"""统计频道最近几天每天的消息数和图片数，估算 ntfy 用量。"""
+"""统计频道最近几天每天的消息数和图片数。"""
 import collections, re, sys, time, urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -35,10 +35,10 @@ for _ in range(200):
     time.sleep(1)
 
 print(f"频道 {channel} 最近 {days} 天（北京时间）：")
-print("日期    消息  图片  ntfy用量(消息+图片)")
+print("日期    消息  图片")
 tot = [0, 0]
 for d in sorted(stats):
     m, i = stats[d]; tot[0] += m; tot[1] += i
-    print(f"{d}   {m:4d}  {i:4d}  {m+i:5d}")
+    print(f"{d}   {m:4d}  {i:4d}")
 n = len(stats) or 1
-print(f"日均: 消息 {tot[0]/n:.0f}，图片 {tot[1]/n:.0f}，ntfy 用量 {(tot[0]+tot[1])/n:.0f} 条/天（免费上限 250）")
+print(f"日均: 消息 {tot[0]/n:.0f}，图片 {tot[1]/n:.0f}")

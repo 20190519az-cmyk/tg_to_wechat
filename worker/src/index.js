@@ -1,20 +1,24 @@
 /**
  * Cloudflare Worker：每分钟抓取 Telegram 公开频道网页版 (t.me/s/<频道>)，
- * 把新消息推送到企业微信群机器人和/或 ntfy。已转发的最新消息 ID 存在 KV (STATE)。
+ * 把新消息推送到企业微信群机器人和/或飞书群机器人。已转发的最新消息 ID 存在 KV (STATE)。
  *
- * 绑定 / 变量（企微和 ntfy 至少配一个）：
- *   STATE          KV 命名空间
- *   WECOM_WEBHOOK  企微群机器人 webhook（wrangler secret）
- *   NTFY_URL       ntfy 主题地址，如 https://ntfy.sh/<主题>（wrangler secret）
- *   NTFY_TOKEN     ntfy 访问令牌，可选（wrangler secret）
- *   TG_CHANNEL     频道用户名，不带 @
+ * 绑定 / 变量（企微和飞书至少配一个，都是 wrangler secret）：
+ *   STATE              KV 命名空间
+ *   WECOM_WEBHOOK      企微群机器人 webhook
+ *   FEISHU_WEBHOOK     飞书群自定义机器人 webhook
+ *   FEISHU_SECRET      飞书机器人签名密钥，可选（机器人开启了「签名校验」时必填）
+ *   FEISHU_APP_ID      飞书自建应用 App ID，可选（配了才能在飞书里发图片）
+ *   FEISHU_APP_SECRET  飞书自建应用 App Secret，可选
+ *   TG_CHANNEL         频道用户名，不带 @
  */
 import { Buffer } from "node:buffer";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 
 const TEXT_LIMIT = 2000;
 const IMAGE_LIMIT = 2 * 1024 * 1024; // 企微图片上限
-const NTFY_IMAGE_LIMIT = 2 * 1024 * 1024; // ntfy.sh 免费附件上限
+const FEISHU_IMAGE_LIMIT = 10 * 1024 * 1024; // 飞书图片上限
+const FEISHU_TEXT_LIMIT = 15000; // 飞书 webhook 请求体上限 20KB，正文留余量
+const FEISHU_API = "https://open.feishu.cn/open-apis";
 const SEND_INTERVAL = 3200; // 企微限 20 条/分钟
 const MAX_SENDS_PER_RUN = 18; // 每分钟跑一次，单次最多发 18 条，剩下的下一分钟继续
 const UA = {
@@ -59,9 +63,9 @@ function channelOf(env) {
 export async function run(env) {
   const channel = channelOf(env);
   const sender = new Sender(env.WECOM_WEBHOOK || null);
-  // 只配了 ntfy 时，ntfy 出错要中止并补发；同时配了企微时 ntfy 只是尽力而为，不影响企微
-  const ntfy = env.NTFY_URL ? new Ntfy(env.NTFY_URL, env.NTFY_TOKEN, !env.WECOM_WEBHOOK) : null;
-  if (!env.WECOM_WEBHOOK && !ntfy) throw new Error("WECOM_WEBHOOK 和 NTFY_URL 至少要配一个");
+  // 只配了飞书时，飞书出错要中止并补发；同时配了企微时飞书只是尽力而为，不影响企微（也避免企微重复发送）
+  const feishu = env.FEISHU_WEBHOOK ? new Feishu(env, !env.WECOM_WEBHOOK) : null;
+  if (!env.WECOM_WEBHOOK && !feishu) throw new Error("WECOM_WEBHOOK 和 FEISHU_WEBHOOK 至少要配一个");
 
   const res = await fetch(`https://t.me/s/${channel}`, { headers: UA });
   if (!res.ok) throw new Error(`抓取失败: HTTP ${res.status}`);
@@ -76,7 +80,7 @@ export async function run(env) {
     const newest = posts[posts.length - 1].id;
     const hello = `✅ 已开始监听【${title}】，之后的新消息会自动转发过来。`;
     await sender.text(hello);
-    if (ntfy) await ntfy.text(title, hello);
+    if (feishu) await feishu.post(title, hello);
     await env.STATE.put(channel, String(newest));
     console.log(`初始化完成，从 #${newest} 之后开始转发`);
     return;
@@ -91,14 +95,14 @@ export async function run(env) {
       const parts = splitBytes(formatPost(p, title, channel), TEXT_LIMIT).length + p.photos.length;
       // 剩余额度不够发完整条消息就留到下一分钟（单条超额时至少发一条，避免卡死）
       if (done !== lastId && sender.count + parts > MAX_SENDS_PER_RUN) break;
-      await sender.text(formatPost(p, title, channel));
-      if (ntfy) await ntfy.text(title, formatBody(p), `https://t.me/${channel}/${p.id}`);
-      for (const [i, url] of p.photos.entries()) {
+      const images = [];
+      for (const url of p.photos) {
         const data = await downloadImage(url);
-        if (!data) continue;
-        await sender.image(data);
-        if (ntfy) await ntfy.image(title, data, `${p.id}_${i + 1}.jpg`);
+        if (data) images.push(data);
       }
+      await sender.text(formatPost(p, title, channel));
+      for (const data of images) await sender.image(data);
+      if (feishu) await feishu.post(title, formatBody(p), `https://t.me/${channel}/${p.id}`, images);
       done = p.id;
     }
   } finally {
@@ -280,51 +284,93 @@ class Sender {
   }
 }
 
-// ---------------- ntfy ----------------
-class Ntfy {
-  constructor(topicUrl, token, strict) {
-    const u = new URL(topicUrl);
-    this.topicUrl = u.origin + u.pathname.replace(/\/$/, "");
-    this.auth = token ? { Authorization: `Bearer ${token}` } : {};
+// ---------------- 飞书 ----------------
+class Feishu {
+  constructor(env, strict) {
+    this.webhook = env.FEISHU_WEBHOOK;
+    this.secret = env.FEISHU_SECRET || "";
+    this.appId = env.FEISHU_APP_ID || "";
+    this.appSecret = env.FEISHU_APP_SECRET || "";
     this.strict = strict;
+    this.token = null; // tenant_access_token，本次运行内复用
   }
 
-  async send(desc, doFetch) {
+  // 一条帖子发成一条富文本消息：标题 + 正文 + 原帖链接 + 图片
+  async post(title, text, link, images = []) {
     try {
-      const r = await doFetch();
-      if (r.status === 507) { // up 开头的主题：没有在线的订阅者，额度无处计算
-        throw new Error("HTTP 507，手机 ntfy 未在线订阅（请开启即时送达并允许后台运行）");
+      const body = splitBytes(text, FEISHU_TEXT_LIMIT);
+      const content = (body.length > 1 ? body[0] + "…" : body[0]).split("\n")
+        .map((line) => [{ tag: "text", text: line }]);
+      if (link) content.push([{ tag: "a", text: "查看原帖", href: link }]);
+      let missing = 0;
+      for (const data of images) {
+        const key = await this.uploadImage(data);
+        if (key) content.push([{ tag: "img", image_key: key }]);
+        else missing++;
       }
-      if (!r.ok) throw new Error(`HTTP ${r.status} ${(await r.text()).slice(0, 200)}`);
+      if (missing) {
+        const note = this.appId ? `${missing} 张图片未能上传` : `含 ${missing} 张图片`;
+        content.push([{ tag: "text", text: `[${note}，请点原帖查看]` }]);
+      }
+      await this.send({ msg_type: "post", content: { post: { zh_cn: { title, content } } } });
     } catch (e) {
-      if (this.strict) throw new Error(`ntfy ${desc}发送失败: ${e.message}`);
-      console.log(`ntfy ${desc}发送失败: ${e.message}`);
+      if (this.strict) throw new Error(`飞书发送失败: ${e.message}`);
+      console.log(`飞书发送失败: ${e.message}`);
     }
   }
 
-  // 主题写在地址里（而不是 JSON 发布），这样 up 开头的主题能用订阅者的额度
-  text(title, message, click) {
-    const q = new URLSearchParams({ title });
-    if (click) q.set("click", click);
-    return this.send("文字", () => fetch(`${this.topicUrl}?${q}`, {
+  async send(payload) {
+    if (this.secret) { // 签名校验：以「时间戳\n密钥」为 key 对空串做 HmacSHA256
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      payload = {
+        timestamp,
+        sign: createHmac("sha256", `${timestamp}\n${this.secret}`).update("").digest("base64"),
+        ...payload,
+      };
+    }
+    const r = await fetch(this.webhook, {
       method: "POST",
-      headers: { "content-type": "text/plain; charset=utf-8", ...this.auth },
-      body: message,
-    }));
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await r.json().catch(() => ({}));
+    const code = data.code ?? data.StatusCode;
+    if (code !== 0) throw new Error(`HTTP ${r.status} ${JSON.stringify(data)}`);
   }
 
-  // 图片作为附件上传到 ntfy，国内打开 App 也能直接看到（不依赖 Telegram 的图片地址）
-  image(title, data, filename) {
-    if (data.length > NTFY_IMAGE_LIMIT) {
-      console.log("图片超过 2MB，ntfy 跳过");
-      return;
+  // 没配自建应用时返回 null，图片只能靠原帖链接查看
+  async uploadImage(data) {
+    if (!this.appId || !this.appSecret) return null;
+    if (data.length > FEISHU_IMAGE_LIMIT) {
+      console.log("图片超过 10MB，飞书跳过");
+      return null;
     }
-    const q = new URLSearchParams({ filename, title, message: "图片" });
-    return this.send("图片", () => fetch(`${this.topicUrl}?${q}`, {
-      method: "PUT",
-      headers: this.auth,
-      body: data,
-    }));
+    try {
+      if (!this.token) {
+        const r = await fetch(`${FEISHU_API}/auth/v3/tenant_access_token/internal`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ app_id: this.appId, app_secret: this.appSecret }),
+        });
+        const t = await r.json();
+        if (t.code !== 0) throw new Error(`获取 token 失败: ${JSON.stringify(t)}`);
+        this.token = t.tenant_access_token;
+      }
+      const form = new FormData();
+      form.append("image_type", "message");
+      form.append("image", new Blob([data]), "image.jpg");
+      const r = await fetch(`${FEISHU_API}/im/v1/images`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${this.token}` },
+        body: form,
+      });
+      const res = await r.json();
+      if (res.code !== 0) throw new Error(JSON.stringify(res));
+      return res.data.image_key;
+    } catch (e) {
+      console.log(`飞书图片上传失败: ${e.message}`);
+      return null;
+    }
   }
 }
 
