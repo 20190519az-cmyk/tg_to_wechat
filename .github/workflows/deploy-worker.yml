@@ -75,6 +75,20 @@ jobs:
             echo "已从 state.json 导入进度: #$last"
           fi
 
+      - name: 准备 workers.dev 子域名（新账号设置定时任务需要）
+        run: |
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain"
+          auth=(-H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          sub=$(curl -sS "${auth[@]}" "$api" | jq -r '.result.subdomain // empty')
+          if [ -z "$sub" ]; then
+            sub="tg2wecom-$(echo "$CLOUDFLARE_ACCOUNT_ID" | cut -c1-8)"
+            curl -fsS "${auth[@]}" -H "Content-Type: application/json" -X PUT "$api" \
+                 -d "{\"subdomain\":\"$sub\"}" > /dev/null
+            echo "已创建子域名: $sub.workers.dev"
+          else
+            echo "已有子域名: $sub.workers.dev"
+          fi
+
       - name: 部署
         run: |
           secrets=$(mktemp)
