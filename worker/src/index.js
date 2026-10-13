@@ -14,7 +14,7 @@ import { createHash } from "node:crypto";
 
 const TEXT_LIMIT = 2000;
 const IMAGE_LIMIT = 2 * 1024 * 1024; // 企微图片上限
-const NTFY_IMAGE_LIMIT = 15 * 1024 * 1024; // ntfy.sh 附件上限
+const NTFY_IMAGE_LIMIT = 2 * 1024 * 1024; // ntfy.sh 免费附件上限
 const SEND_INTERVAL = 3200; // 企微限 20 条/分钟
 const MAX_SENDS_PER_RUN = 18; // 每分钟跑一次，单次最多发 18 条，剩下的下一分钟继续
 const UA = {
@@ -285,8 +285,6 @@ class Ntfy {
   constructor(topicUrl, token, strict) {
     const u = new URL(topicUrl);
     this.topicUrl = u.origin + u.pathname.replace(/\/$/, "");
-    this.origin = u.origin;
-    this.topic = u.pathname.replace(/^\/|\/$/g, "");
     this.auth = token ? { Authorization: `Bearer ${token}` } : {};
     this.strict = strict;
   }
@@ -294,6 +292,9 @@ class Ntfy {
   async send(desc, doFetch) {
     try {
       const r = await doFetch();
+      if (r.status === 507) { // up 开头的主题：没有在线的订阅者，额度无处计算
+        throw new Error("HTTP 507，手机 ntfy 未在线订阅（请开启即时送达并允许后台运行）");
+      }
       if (!r.ok) throw new Error(`HTTP ${r.status} ${(await r.text()).slice(0, 200)}`);
     } catch (e) {
       if (this.strict) throw new Error(`ntfy ${desc}发送失败: ${e.message}`);
@@ -301,20 +302,21 @@ class Ntfy {
     }
   }
 
+  // 主题写在地址里（而不是 JSON 发布），这样 up 开头的主题能用订阅者的额度
   text(title, message, click) {
-    const body = { topic: this.topic, title, message };
-    if (click) body.click = click;
-    return this.send("文字", () => fetch(this.origin, {
+    const q = new URLSearchParams({ title });
+    if (click) q.set("click", click);
+    return this.send("文字", () => fetch(`${this.topicUrl}?${q}`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...this.auth },
-      body: JSON.stringify(body),
+      headers: { "content-type": "text/plain; charset=utf-8", ...this.auth },
+      body: message,
     }));
   }
 
   // 图片作为附件上传到 ntfy，国内打开 App 也能直接看到（不依赖 Telegram 的图片地址）
   image(title, data, filename) {
     if (data.length > NTFY_IMAGE_LIMIT) {
-      console.log("图片超过 15MB，ntfy 跳过");
+      console.log("图片超过 2MB，ntfy 跳过");
       return;
     }
     const q = new URLSearchParams({ filename, title, message: "图片" });
