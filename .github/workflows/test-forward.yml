@@ -1,0 +1,42 @@
+name: 测试转发（重发最新一条）
+
+# 把 Worker 的进度回退一条，Worker 下一分钟会把频道最新一条消息重新转发到群里
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      ACCOUNT_ID_SECRET: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      KV_TITLE: tg2wecom-state
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 回退进度
+        run: |
+          auth=(-H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          account="$ACCOUNT_ID_SECRET"
+          if [ -z "$account" ]; then
+            account=$(curl -fsS "${auth[@]}" "https://api.cloudflare.com/client/v4/accounts" | jq -r '.result[0].id')
+          fi
+          api="https://api.cloudflare.com/client/v4/accounts/$account/storage/kv/namespaces"
+          id=$(curl -fsS "${auth[@]}" "$api?per_page=100" | jq -r --arg t "$KV_TITLE" '.result[] | select(.title==$t) | .id' | head -n1)
+          [ -n "$id" ] || { echo "::error::找不到 KV，请先运行部署"; exit 1; }
+
+          channel=$(sed -n 's/^TG_CHANNEL = "\(.*\)"/\1/p' worker/wrangler.toml)
+          newest=$(curl -fsS -A "Mozilla/5.0" "https://t.me/s/$channel" \
+                   | grep -o "data-post=\"$channel/[0-9]*\"" | grep -o '[0-9]*"$' | tr -d '"' | sort -n | tail -n1)
+          [ -n "$newest" ] || { echo "::error::抓不到频道消息"; exit 1; }
+          current=$(curl -fsS "${auth[@]}" "$api/$id/values/$channel")
+          echo "频道最新: #$newest，当前进度: #$current"
+
+          target=$((newest - 1))
+          if [ "$current" -le "$target" ]; then
+            echo "已有待转发的消息，不需要回退，Worker 下一分钟会发出"
+          else
+            curl -fsS "${auth[@]}" -X PUT "$api/$id/values/$channel" --data "$target" > /dev/null
+            echo "进度已回退到 #$target，1 分钟内群里会收到 #$newest"
+          fi
