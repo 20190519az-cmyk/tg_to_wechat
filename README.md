@@ -8,20 +8,18 @@
 
 ### 1. 准备 Cloudflare
 1. 注册并登录 [Cloudflare](https://dash.cloudflare.com/sign-up)，免费套餐就够。
-2. **Account ID**：控制台首页 → 右侧「Account details」→ 复制 Account ID。
-   找不到的话，可以看浏览器地址栏 `dash.cloudflare.com/` 后面那串 32 位字符。
-3. **API Token**：右上角头像 → My Profile → API Tokens → Create Token →
+2. **API Token**：右上角头像 → My Profile → API Tokens → Create Token →
    选「**Edit Cloudflare Workers**」模板 → Account Resources 选你的账号，Zone Resources 选 All zones →
    Continue → Create Token → 复制 Token（只显示一次）。
 
 ### 2. 添加 GitHub Secrets
-仓库 → Settings → Secrets and variables → Actions → New repository secret，一共三个：
+仓库 → Settings → Secrets and variables → Actions → New repository secret：
 
 | Name | Value |
 |---|---|
 | `WECOM_WEBHOOK` | 企微群机器人 webhook 地址 |
 | `CLOUDFLARE_API_TOKEN` | 上一步的 API Token |
-| `CLOUDFLARE_ACCOUNT_ID` | 上一步的 Account ID |
+| `CLOUDFLARE_ACCOUNT_ID` | 可选。不填会用 Token 自动获取；只有一个 Cloudflare 账号下有多个 Account 时才需要填（浏览器地址栏 `dash.cloudflare.com/` 后面那串 32 位字符） |
 
 ### 3. 部署
 仓库 → Actions → 选「部署 Cloudflare Worker（每分钟转发）」→ Run workflow。

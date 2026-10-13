@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 10
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      ACCOUNT_ID_SECRET: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
       KV_TITLE: tg2wecom-state
     defaults:
@@ -28,9 +28,22 @@ jobs:
 
       - name: 检查 Secrets
         run: |
-          for v in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID WECOM_WEBHOOK; do
+          for v in CLOUDFLARE_API_TOKEN WECOM_WEBHOOK; do
             if [ -z "${!v}" ]; then echo "::error::缺少仓库 Secret: $v"; exit 1; fi
           done
+          # 没填 CLOUDFLARE_ACCOUNT_ID 时用 API Token 自动查
+          if [ -n "$ACCOUNT_ID_SECRET" ]; then
+            echo "CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID_SECRET" >> "$GITHUB_ENV"
+          else
+            ids=$(curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+                  "https://api.cloudflare.com/client/v4/accounts" | jq -r '.result[].id')
+            if [ "$(echo "$ids" | grep -c .)" != "1" ]; then
+              echo "::error::无法自动确定 Account ID（找到 $(echo "$ids" | grep -c .) 个账号），请添加 Secret: CLOUDFLARE_ACCOUNT_ID"
+              exit 1
+            fi
+            echo "CLOUDFLARE_ACCOUNT_ID=$ids" >> "$GITHUB_ENV"
+            echo "自动获取 Account ID 成功"
+          fi
 
       - uses: actions/setup-node@v4
         with:
