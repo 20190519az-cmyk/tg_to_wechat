@@ -26,6 +26,9 @@ const MAX_SENDS_PER_RUN = 18; // 每分钟跑一次，单次最多发 18 条，�
 const MAX_POSTS_PER_RUN = 3;
 const MAX_IMAGES_PER_RUN = 4;
 const LOCK_MS = 3 * 60 * 1000; // 上一轮被中断时，锁最多保留 3 分钟
+const MAX_BACKFILL_PAGES = 5; // 网页版每页约 20 条；积压时最多往前翻 5 页补漏
+const FEISHU_RETRY_MAX = 5; // 飞书单独失败的帖子最多补发 5 次
+const FEISHU_QUEUE_MAX = 50;
 const UA = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -104,6 +107,14 @@ export class State extends DurableObject {
     await this.ctx.storage.delete("__lock");
   }
 
+  async getQueue() {
+    return (await this.ctx.storage.get("__feishu_queue")) ?? [];
+  }
+
+  async setQueue(q) {
+    await this.ctx.storage.put("__feishu_queue", q.slice(-FEISHU_QUEUE_MAX));
+  }
+
   // 记录某条帖子第几次尝试：反复中途失败（如图片太大超出 CPU 限制）时改为只发文字，避免卡死、反复重发
   async attempt(id) {
     const a = await this.ctx.storage.get("__attempt");
@@ -128,10 +139,25 @@ async function loadProgress(env, channel) {
   return stored;
 }
 
-async function fetchPosts(channel) {
-  const res = await fetch(`https://t.me/s/${channel}`, { headers: UA });
+async function fetchPage(channel, before) {
+  const url = `https://t.me/s/${channel}` + (before ? `?before=${before}` : "");
+  const res = await fetch(url, { headers: UA });
   if (!res.ok) throw new Error(`抓取失败: HTTP ${res.status}`);
   return splitPosts(await res.text(), channel);
+}
+
+// 抓最新一页；如果最早一条和已转发进度之间有缺口（积压超过一页），往前翻页补齐
+async function fetchPosts(channel, lastId = null) {
+  const first = await fetchPage(channel);
+  let posts = first.posts;
+  for (let page = 0; lastId !== null && posts.length && posts[0].id > lastId + 1 &&
+       page < MAX_BACKFILL_PAGES; page++) {
+    const older = (await fetchPage(channel, posts[0].id)).posts.filter((p) => p.id < posts[0].id);
+    if (!older.length) break;
+    console.log(`往前翻页补漏：#${older[0].id}～#${older[older.length - 1].id}`);
+    posts = older.concat(posts);
+  }
+  return { title: first.title, posts };
 }
 
 export async function run(env) {
@@ -154,13 +180,13 @@ export async function run(env) {
 }
 
 async function runLocked(env, channel, state, sender, feishu) {
-  const { title, posts } = await fetchPosts(channel);
+  const stored = await loadProgress(env, channel);
+  const { title, posts } = await fetchPosts(channel, stored === null ? null : Number(stored));
   if (!posts.length) {
     console.log("没有抓到任何消息，跳过");
     return;
   }
 
-  const stored = await loadProgress(env, channel);
   if (stored === null) { // 首次运行：不刷屏，只记录位置并发一条测试消息
     const newest = posts[posts.length - 1].id;
     const hello = `✅ 已开始监听【${title}】，之后的新消息会自动转发过来。`;
@@ -171,20 +197,47 @@ async function runLocked(env, channel, state, sender, feishu) {
     return;
   }
 
+  let handled = 0;
+  let imageCount = 0;
+
+  // 先补发一条之前飞书单独失败的帖子（企微当时已发过，这里只补飞书）
+  const queue = feishu ? await state.getQueue() : [];
+  if (queue.length) {
+    const item = queue[0];
+    item.tries = (item.tries || 0) + 1;
+    await state.setQueue(queue); // 先记次数：本轮被中断也不会无限重试
+    const images = [];
+    for (const url of item.post.photos) {
+      const data = await downloadImage(url);
+      if (data) images.push(data);
+    }
+    const link = `https://t.me/${channel}/${item.post.id}`;
+    if (await feishu.post(item.title, formatBody(item.post), link, images)) {
+      console.log(`飞书补发成功 #${item.post.id}`);
+      queue.shift();
+    } else if (item.tries >= FEISHU_RETRY_MAX) {
+      console.log(`飞书补发 #${item.post.id} 已失败 ${item.tries} 次，放弃`);
+      queue.shift();
+    } else {
+      queue.push(queue.shift()); // 排到队尾，下次先试别的
+    }
+    await state.setQueue(queue);
+    handled++;
+    imageCount += item.post.photos.length;
+  }
+
   const lastId = Number(stored);
   const newPosts = posts.filter((p) => p.id > lastId);
   console.log(`发现 ${newPosts.length} 条新消息`);
-  let done = lastId;
-  let handled = 0;
-  let imageCount = 0;
+  let newHandled = 0;
   for (const raw of newPosts) {
     const p = await parsePost(raw);
-    // 每轮的帖子数、图片数、企微条数有上限，超了留到下一分钟（每轮至少处理一条，避免卡死）
-    if (handled > 0) {
+    // 每轮的帖子数、图片数、企微条数有上限，超了留到下一分钟（每轮至少处理一条新帖子，避免卡死）
+    if (newHandled > 0) {
       const parts = splitBytes(formatPost(p, title, channel), TEXT_LIMIT).length + p.photos.length;
       if (handled >= MAX_POSTS_PER_RUN || imageCount + p.photos.length > MAX_IMAGES_PER_RUN ||
           sender.count + parts > MAX_SENDS_PER_RUN) {
-        console.log(`本轮先处理 ${handled} 条，剩下的下一分钟继续`);
+        console.log("本轮先处理到这里，剩下的下一分钟继续");
         break;
       }
     }
@@ -200,12 +253,17 @@ async function runLocked(env, channel, state, sender, feishu) {
     }
     await sender.text(formatPost(p, title, channel));
     for (const data of images) await sender.image(data);
-    if (feishu) await feishu.post(title, formatBody(p), `https://t.me/${channel}/${p.id}`, images);
-    done = p.id;
+    if (feishu && !(await feishu.post(title, formatBody(p), `https://t.me/${channel}/${p.id}`, images))) {
+      const q = await state.getQueue();
+      q.push({ title, post: p, tries: 0 });
+      await state.setQueue(q);
+      console.log(`#${p.id} 飞书发送失败，已加入补发队列`);
+    }
     handled++;
+    newHandled++;
     imageCount += p.photos.length;
     // 每条发完立刻记进度：本轮之后被中断（如超出 CPU 限制）也不会重复发已发过的
-    await state.put(channel, String(done));
+    await state.put(channel, String(p.id));
   }
 }
 
@@ -380,7 +438,8 @@ class Feishu {
     this.token = null; // tenant_access_token，本次运行内复用
   }
 
-  // 一条帖子发成一条富文本消息：正文 + 原帖链接 + 图片，发到每个目标群
+  // 一条帖子发成一条富文本消息：正文 + 原帖链接 + 图片，发到每个目标群。
+  // 和企微一起用时出错只返回 false（由调用方放进补发队列）；只用飞书时直接抛错，进度不推进
   async post(title, text, link, images = []) {
     try {
       const body = splitBytes(text, FEISHU_TEXT_LIMIT);
@@ -404,9 +463,11 @@ class Feishu {
           body: JSON.stringify({ receive_id: chatId, msg_type: "post", content: msg }),
         });
       }
+      return true;
     } catch (e) {
       if (this.strict) throw new Error(`飞书发送失败: ${e.message}`);
       console.log(`飞书发送失败: ${e.message}`);
+      return false;
     }
   }
 
